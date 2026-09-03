@@ -2,8 +2,8 @@
 
 from app.db.client import get_client
 
-# Only static attributes can contradict. Wardrobe and location change
-# by design — a character changing clothes is not a continuity error.
+
+# --- Check 1: static attribute contradiction (GROUP BY + uniqExact) -----
 STATIC_CONTRADICTION = """
 SELECT
     character_id,
@@ -23,40 +23,189 @@ ORDER BY variant_count DESC, character_id
 
 
 def run_character_consistency(project_id):
-    """Return every static character attribute that contradicts itself.
+    """Static character attributes that contradict themselves.
 
     Dynamic attributes (wardrobe, location, mood) are excluded: they are
     expected to change. Each finding carries the episode, scene, and the
     verbatim line that produced it.
     """
-    client = get_client()
-    result = client.query(
-        STATIC_CONTRADICTION,
-        parameters={"project_id": project_id},
-    )
+    result = get_client().query(
+        STATIC_CONTRADICTION, parameters={"project_id": project_id})
 
     findings = []
-    for row in result.result_rows:
-        character_id, attribute, values, episodes, scenes, evidence, n = row
+    for cid, attr, values, eps, scenes, quotes, n in result.result_rows:
         findings.append({
-            "character_id": character_id,
-            "attribute": attribute,
+            "check": "character_consistency",
+            "character_id": cid,
+            "attribute": attr,
             "severity": "severe" if n > 2 else "moderate",
             "conflict": [
-                {
-                    "value": v,
-                    "episode": e,
-                    "scene": s,
-                    "quote": q,
-                }
-                for v, e, s, q in zip(values, episodes, scenes, evidence)
+                {"value": v, "episode": e, "scene": s, "quote": q}
+                for v, e, s, q in zip(values, eps, scenes, quotes)
             ],
         })
+    return findings
+
+
+# --- Check 2: timeline regression (window function) ---------------------
+# --- Check 2: timeline regression (segments + window functions) --------
+# Gemini records raw cues only. The database resolves the timeline:
+# every absolute anchor starts a new segment, and within a segment the
+# day is the anchor plus the running sum of relative deltas.
+TIMELINE_REGRESSION = """
+WITH segmented AS (
+    SELECT
+        episode_number,
+        anchor_day,
+        delta_days,
+        time_cue,
+        sum(anchor_day >= 0) OVER (ORDER BY episode_number) AS seg_id
+    FROM episodes
+    WHERE project_id = {project_id:String}
+),
+resolved AS (
+    SELECT
+        episode_number,
+        time_cue,
+        max(anchor_day) OVER (PARTITION BY seg_id) AS seg_anchor,
+        sum(delta_days) OVER (
+            PARTITION BY seg_id ORDER BY episode_number
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS cum_delta
+    FROM segmented
+),
+days AS (
+    SELECT
+        episode_number,
+        time_cue,
+        if(seg_anchor >= 0, seg_anchor, 1) + cum_delta AS story_day
+    FROM resolved
+)
+SELECT
+    episode_number,
+    story_day,
+    time_cue,
+    lagInFrame(episode_number) OVER (ORDER BY episode_number) AS prev_ep,
+    lagInFrame(story_day)      OVER (ORDER BY episode_number) AS prev_day
+FROM days
+QUALIFY prev_ep > 0 AND story_day < prev_day
+ORDER BY episode_number
+"""
+
+
+def run_timeline_consistency(project_id):
+    """Episodes where resolved story time moves backwards.
+
+    The model never computes a date. It records only the cue it saw
+    ("three weeks later", "flashback to week one"). The database turns
+    those cues into a timeline and decides whether time regressed.
+    """
+    result = get_client().query(
+        TIMELINE_REGRESSION, parameters={"project_id": project_id})
+
+    return [{
+        "check": "timeline_consistency",
+        "severity": "severe",
+        "episode": ep,
+        "detail": (f"Episode {ep} resolves to story day {day}, but "
+                   f"episode {prev_ep} was already at day {prev_day}. "
+                   f"Story time moves backwards."),
+        "conflict": [
+            {"episode": prev_ep, "story_day": prev_day},
+            {"episode": ep, "story_day": day, "quote": cue},
+        ],
+    } for ep, day, cue, prev_ep, prev_day in result.result_rows]
+
+
+# --- Check 3: reveal before setup (self-join) ---------------------------
+REVEAL_BEFORE_SETUP = """
+SELECT
+    s.thread_id,
+    s.description   AS setup_text,
+    s.episode_number AS setup_episode,
+    r.description   AS reveal_text,
+    r.episode_number AS reveal_episode
+FROM plot_points AS s
+INNER JOIN plot_points AS r ON s.thread_id = r.thread_id
+WHERE s.project_id = {project_id:String}
+  AND r.project_id = {project_id:String}
+  AND s.point_type = 'setup'
+  AND r.point_type = 'reveal'
+  AND r.episode_number < s.episode_number
+ORDER BY s.thread_id
+"""
+
+
+def run_plot_consistency(project_id):
+    """Mysteries whose answer lands before the question is asked."""
+    result = get_client().query(
+        REVEAL_BEFORE_SETUP, parameters={"project_id": project_id})
+
+    return [{
+        "check": "plot_consistency",
+        "severity": "severe",
+        "thread_id": thread,
+        "detail": (f"The reveal lands in episode {rev_ep} but its setup "
+                   f"is not planted until episode {set_ep}."),
+        "conflict": [
+            {"role": "reveal", "episode": rev_ep, "quote": rev_text},
+            {"role": "setup", "episode": set_ep, "quote": set_text},
+        ],
+    } for thread, set_text, set_ep, rev_text, rev_ep in result.result_rows]
+
+
+# --- Check 4: repeated dialogue (GROUP BY + count) ----------------------
+DIALOGUE_REPETITION = """
+SELECT
+    line_text,
+    count()                    AS times_used,
+    groupArray(episode_number) AS episodes,
+    groupArray(speaker)        AS speakers
+FROM dialogue_lines
+WHERE project_id = {project_id:String}
+  AND length(line_text) > 15
+GROUP BY line_text
+HAVING times_used > 1
+ORDER BY times_used DESC
+"""
+
+
+def run_dialogue_repetition(project_id):
+    """Lines reused across the season."""
+    result = get_client().query(
+        DIALOGUE_REPETITION, parameters={"project_id": project_id})
+
+    return [{
+        "check": "dialogue_repetition",
+        "severity": "severe" if n > 2 else "moderate",
+        "line": line,
+        "times_used": n,
+        "conflict": [
+            {"episode": e, "speaker": sp, "quote": line}
+            for e, sp in zip(eps, speakers)
+        ],
+    } for line, n, eps, speakers in result.result_rows]
+
+
+# --- Runner -------------------------------------------------------------
+CHECKS = {
+    "character_consistency": run_character_consistency,
+    "timeline_consistency": run_timeline_consistency,
+    "plot_consistency": run_plot_consistency,
+    "dialogue_repetition": run_dialogue_repetition,
+}
+
+
+def run_all_checks(project_id):
+    """Run every deterministic check and return all findings."""
+    findings = []
+    for fn in CHECKS.values():
+        findings.extend(fn(project_id))
     return findings
 
 
 if __name__ == "__main__":
     import json
     import sys
-    project = sys.argv[1] if len(sys.argv) > 1 else "demo"
-    print(json.dumps(run_character_consistency(project), indent=2))
+    project = sys.argv[1] if len(sys.argv) > 1 else "demo1"
+    print(json.dumps(run_all_checks(project), indent=2))
