@@ -153,6 +153,52 @@ def run_plot_consistency(project_id):
         ],
     } for thread, planted, last, setups, text in result.result_rows]
 
+# --- Check 5: cliffhanger repetition (lagInFrame comparison) -----------
+# Each episode reports only its own cliffhanger type. No episode knows
+# what the one before it used. The database compares neighbours.
+CLIFFHANGER_REPETITION = """
+SELECT
+    episode_number,
+    cliffhanger_type,
+    prev_ep
+FROM (
+    SELECT
+        episode_number,
+        cliffhanger_type,
+        lagInFrame(cliffhanger_type) OVER (ORDER BY episode_number)
+            AS prev_type,
+        lagInFrame(episode_number) OVER (ORDER BY episode_number)
+            AS prev_ep
+    FROM episodes
+    WHERE project_id = {project_id:String}
+      AND cliffhanger_type != 'none'
+)
+WHERE prev_ep > 0 AND cliffhanger_type = prev_type
+ORDER BY episode_number
+"""
+
+
+def run_cliffhanger_pacing(project_id):
+    """Consecutive episodes that end on the same kind of hook.
+
+    Vertical drama lives on hook variety: two 'betrayal' endings in a
+    row flattens the pull into the next episode.
+    """
+    result = get_client().query(
+        CLIFFHANGER_REPETITION, parameters={"project_id": project_id})
+
+    return [{
+        "check": "cliffhanger_pacing",
+        "severity": "moderate",
+        "episode": ep,
+        "detail": (f"Episode {ep} ends on a '{ctype}' cliffhanger, the "
+                   f"same type episode {prev_ep} just used. Consecutive "
+                   f"hooks of one type flatten the pull forward."),
+        "conflict": [
+            {"episode": prev_ep, "cliffhanger_type": ctype},
+            {"episode": ep, "cliffhanger_type": ctype},
+        ],
+    } for ep, ctype, prev_ep in result.result_rows]
 
 # --- Check 4: repeated dialogue (GROUP BY + count) ----------------------
 DIALOGUE_REPETITION = """
@@ -193,6 +239,7 @@ CHECKS = {
     "timeline_consistency": run_timeline_consistency,
     "plot_consistency": run_plot_consistency,
     "dialogue_repetition": run_dialogue_repetition,
+    "cliffhanger_pacing": run_cliffhanger_pacing,
 }
 
 
