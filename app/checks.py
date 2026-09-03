@@ -47,9 +47,8 @@ def run_character_consistency(project_id):
     return findings
 
 
-# --- Check 2: timeline regression (window function) ---------------------
 # --- Check 2: timeline regression (segments + window functions) --------
-# Gemini records raw cues only. The database resolves the timeline:
+# The model records raw cues only. The database resolves the timeline:
 # every absolute anchor starts a new segment, and within a segment the
 # day is the anchor plus the running sum of relative deltas.
 TIMELINE_REGRESSION = """
@@ -117,41 +116,42 @@ def run_timeline_consistency(project_id):
     } for ep, day, cue, prev_ep, prev_day in result.result_rows]
 
 
-# --- Check 3: reveal before setup (self-join) ---------------------------
-REVEAL_BEFORE_SETUP = """
+# --- Check 3: unresolved plot threads (countIf + HAVING) ---------------
+# A question the season plants and never answers. Each episode reports
+# only what it planted or answered; no episode knows what the rest of
+# the season does with a thread. The database decides what was left
+# hanging.
+DANGLING_THREADS = """
 SELECT
-    s.thread_id,
-    s.description   AS setup_text,
-    s.episode_number AS setup_episode,
-    r.description   AS reveal_text,
-    r.episode_number AS reveal_episode
-FROM plot_points AS s
-INNER JOIN plot_points AS r ON s.thread_id = r.thread_id
-WHERE s.project_id = {project_id:String}
-  AND r.project_id = {project_id:String}
-  AND s.point_type = 'setup'
-  AND r.point_type = 'reveal'
-  AND r.episode_number < s.episode_number
-ORDER BY s.thread_id
+    thread_id,
+    min(episode_number)                  AS planted_episode,
+    max(episode_number)                  AS last_touched,
+    countIf(point_type = 'setup')        AS setups,
+    argMin(description, episode_number)  AS planted_text
+FROM plot_points
+WHERE project_id = {project_id:String}
+GROUP BY thread_id
+HAVING countIf(point_type = 'reveal') = 0
+ORDER BY planted_episode
 """
 
 
 def run_plot_consistency(project_id):
-    """Mysteries whose answer lands before the question is asked."""
+    """Story threads that are planted but never paid off."""
     result = get_client().query(
-        REVEAL_BEFORE_SETUP, parameters={"project_id": project_id})
+        DANGLING_THREADS, parameters={"project_id": project_id})
 
     return [{
         "check": "plot_consistency",
         "severity": "severe",
         "thread_id": thread,
-        "detail": (f"The reveal lands in episode {rev_ep} but its setup "
-                   f"is not planted until episode {set_ep}."),
+        "detail": (f"Thread planted in episode {planted} is never paid "
+                   f"off. It is raised {setups} time(s), last touched in "
+                   f"episode {last}, and no episode reveals the answer."),
         "conflict": [
-            {"role": "reveal", "episode": rev_ep, "quote": rev_text},
-            {"role": "setup", "episode": set_ep, "quote": set_text},
+            {"role": "setup", "episode": planted, "quote": text},
         ],
-    } for thread, set_text, set_ep, rev_text, rev_ep in result.result_rows]
+    } for thread, planted, last, setups, text in result.result_rows]
 
 
 # --- Check 4: repeated dialogue (GROUP BY + count) ----------------------
